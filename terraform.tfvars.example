@@ -2,7 +2,7 @@
 token=""
 cloud_id=""
 folder_id=""
-wg_image_id=""
 private_service_image=""
-path_to_ssh_key="~/.ssh/id_ed25519.pub"
+public_ip_address_id=""
+
 
