@@ -25,8 +25,6 @@
 В результате получим ip серверов, локальный для сервиса и публичный для хоста, можем посмотреть в облаке
 
 ![img_5.png](img_5.png)
-# @todo Тагир чекнет что нет так с ключами и cloud init 
-
 
 
 # Запуск
@@ -71,49 +69,19 @@ Please go to <Ваша ссылка> in order to obtain OAuth token.
 ---
 
 В спецификации для создания ресурсов нужно присвоить переменным терраформа значения, есть 2 способа это сделать
- 1. В Интерактивном режиме, при запуске terraform ввести значения переменным(это неудобно)
-```shell
-terraform plan
-var.cloud_id
-  Айди облака, в котором будут создаваться ресурсы
-
-  Enter a value: b1g***********
-
-var.folder_id
-  Айди папки, в котором будут создаваться ресурсы
-
-  Enter a value: b1gmq4m*********** 
-
-var.gitlab_image_id
-  Айди образа для ВМ с впном
-
-  Enter a value: fd88o3huv4mm2jndnrl1 // ПРИМЕР ubuntu 22.04
-
-var.token
-  IAM токен вашего сервисного аккаунта
-
-  Enter a value: y0__xCpn4N*********** 
-
-var.wg_image_id
-  Айди образа для ВМ с впном
- 
-  Enter a value: fd88o3huv4mm2jndnrl1 // ПРИМЕР ubuntu 22.04
-
-
-Terraform used the selected providers to generate the following execution plan. Resource actions are indicated with the following symbols:
-  + create
-
-Terraform will perform the following actions:
-
-  # yandex_compute_instance.wg-server will be created
-
-```
-2.  Через файл terraform.tfvars.example(удобней, если нужно запускать терраформ больше 1 раза)
+1. В Интерактивном режиме, при запуске terraform ввести значения переменным(это неудобно)
+2. Через файл terraform.tfvars.example(удобней, если нужно запускать терраформ больше 1 раза)
     
     Нужно изменить название файла `terraform.tfvars.example` -> `terraform.tfvars`
 
-    После, необходимо вписать нужные значения для переменных 
-
+    После, необходимо вписать нужные значения для переменных
+```shell
+token=""
+cloud_id=""
+folder_id=""
+private_service_image=""
+public_ip_address_id=""
+```
 
 ## Структура 
 
@@ -152,71 +120,92 @@ provider "yandex" {
 ```
 ### `service.tf`
 
-Создаем виртуальную машину с минимальной конфигурацией, в качестве айди образа используем значение из переменной
+Создаем виртуальную машину, на которой будет запущен сервис, к которому мы будем получать доступ с помощью VPN.
 
 Также создаем сеть, сама вм будет без публичного адреса
 
 В метаданные записываем ssh ключ 
 
 ```terraform
+resource "yandex_vpc_route_table" "wg_host_rt" {
+  name       = "wg-host-rt"
+  network_id = yandex_vpc_network.virtual_private_network.id
+
+  static_route {
+    destination_prefix = "0.0.0.0/0"
+    next_hop_address   = "192.168.10.10"
+  }
+}
+
+resource "yandex_vpc_subnet" "private_subnet" {
+  name           = "private-subnet"
+  network_id     = yandex_vpc_network.virtual_private_network.id
+  v4_cidr_blocks = ["192.168.20.0/24"]
+  route_table_id = yandex_vpc_route_table.wg_host_rt.id
+  zone           = "ru-central1-b"
+}
+
 resource "yandex_compute_instance" "private_service" {
-  name = "private_service"
+  name        = "private-service"
   platform_id = "standard-v2"
+  zone        = "ru-central1-b"
 
   resources {
-    cores  = 2
-    memory = 2
+    cores  = 4
+    memory = 8
   }
 
   boot_disk {
     initialize_params {
       image_id = var.private_service_image
+      size     = 100
     }
   }
 
   network_interface {
-    subnet_id          = yandex_vpc_subnet.private_subnet.id
+    subnet_id  = yandex_vpc_subnet.private_subnet.id
+    ip_address = "192.168.20.10"
   }
 
   metadata = {
-    ssh-keys = "ubuntu:${file(var.path_to_ssh_key)}"
+    user-data = <<-EOF
+#cloud-config
+users:
+  - name: user
+    groups: sudo
+    shell: /bin/bash
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    ssh_authorized_keys:
+      - ${file("~/.ssh/id_ed25519.pub")}
+EOF
   }
 }
-
-resource "yandex_vpc_subnet" "private_subnet" {
-  name           = "private_subnet"
-  network_id     = yandex_vpc_network.virtual_private_network.id
-  v4_cidr_blocks = ["192.168.20.0/24"]
-}
-
-resource "yandex_vpc_route_table" "wg-host-rt" {
-  network_id = yandex_vpc_network.virtual_private_network.id
-  name = "wg-host-rt"
-
-  static_route {
-    gateway_id = yandex_vpc_gateway.wg_nat.id
-    destination_prefix = "0.0.0.0/0"
-  }
-}
-
-resource "yandex_vpc_gateway" "wg_nat" {
-  name = "wg-nat"
-  shared_egress_gateway {}
-}
-
-output "internal_ip_address_service" {
-  value = yandex_compute_instance.private_service.network_interface.0.ip_address
-}
-
 ```
 
-`vpn-server.tf`
+### `vpn-server.tf`
 
-Это впн сервер, который должен браться из определенного образа
+Это сервер VPN, его было решено развернуть с помощью опции Container Solution, предоставляемой Yandex Cloud.
+
 ```terraform
+data "yandex_compute_image" "container-optimized-image" {
+  family = "container-optimized-image"
+}
+
+data "yandex_vpc_address" "static_addr" {
+  address_id = var.public_ip_address_id
+}
+
+resource "yandex_vpc_subnet" "server_subnet" {
+  name           = "server-subnet"
+  network_id     = yandex_vpc_network.virtual_private_network.id
+  v4_cidr_blocks = ["192.168.10.0/24"]
+  zone           = "ru-central1-a"
+}
+
 resource "yandex_compute_instance" "wg-server" {
-  name = "wg-server"
+  name        = "wg-server"
   platform_id = "standard-v2"
+  zone        = "ru-central1-a"
 
   resources {
     cores  = 2
@@ -225,72 +214,116 @@ resource "yandex_compute_instance" "wg-server" {
 
   boot_disk {
     initialize_params {
-      image_id = var.wg_image_id
+      image_id = data.yandex_compute_image.container-optimized-image.id
     }
   }
 
   network_interface {
-    subnet_id = yandex_vpc_subnet.server_subnet.id
-    nat = true
+    subnet_id      = yandex_vpc_subnet.server_subnet.id
+    ip_address     = "192.168.10.10"
+    nat_ip_address = data.yandex_vpc_address.static_addr.external_ipv4_address[0].address
+    nat            = true
   }
 
   metadata = {
-    ssh-keys = "ubuntu:${file(var.path_to_ssh_key)}"
+    docker-compose = file("${path.module}/vpn-server-docker-compose.yml")
+    ssh-keys       = "user:${file("~/.ssh/id_ed25519.pub")}"
   }
 }
-
-
-resource "yandex_vpc_subnet" "server_subnet" {
-  name           = "server-subnet"
-  network_id     = yandex_vpc_network.virtual_private_network.id
-  v4_cidr_blocks = ["192.168.10.0/24"]
-}
-
-output "external_ip_address_wg_server" {
-  value = yandex_compute_instance.wg-server.network_interface.0.nat_ip_address
-}
-
 ```
 
-`net.tf`
+Файл docker-compose, описывающий сервис VPN, использующийся в vpn-server.tf
 
-Создает сеть, в которой будет располагаться инфра
+```dockerfile
+volumes:
+  etc_wireguard:
+
+services:
+  wg-easy:
+    environment:
+      # Change Language:
+      # (Supports: en, ua, ru, tr, no, pl, fr, de, ca, es, ko, vi, nl, is, pt, chs, cht, it, th, hi)
+      - LANG=en
+      # ⚠️ Required:
+      # Change this to your host's public address
+      - WG_HOST=89.169.136.33
+
+      # Optional:
+      - PASSWORD_HASH=$$2a$$12$$80EVRBQr.A.YZFDdaTMdwueWGqDDiQEGOu4e.j8UV..SBAmd80NVe
+      # - PORT=51821
+      # - WG_PORT=51820
+      # - WG_CONFIG_PORT=92820
+      - WG_DEFAULT_ADDRESS=10.0.0.x
+      # - WG_DEFAULT_DNS=1.1.1.1
+      - WG_MTU=1500
+      - WG_ALLOWED_IPS=10.0.0.1/32,192.168.20.0/24
+      - WG_PERSISTENT_KEEPALIVE=25
+      # - WG_PRE_UP=echo "Pre Up" > /etc/wireguard/pre-up.txt
+      # - WG_POST_UP=echo "Post Up" > /etc/wireguard/post-up.txt
+      # - WG_PRE_DOWN=echo "Pre Down" > /etc/wireguard/pre-down.txt
+      # - WG_POST_DOWN=echo "Post Down" > /etc/wireguard/post-down.txt
+      # - UI_TRAFFIC_STATS=true
+      # - UI_CHART_TYPE=0 # (0 Charts disabled, 1 # Line chart, 2 # Area chart, 3 # Bar chart)
+
+    image: ghcr.io/wg-easy/wg-easy:latest
+    container_name: wg-easy
+    volumes:
+      - etc_wireguard:/etc/wireguard
+    ports:
+      - "51820:51820/udp"
+      - "51821:51821/tcp"
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+      # - NET_RAW # ⚠️ Uncomment if using Podman
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.src_valid_mark=1
+```
+
+### `net.tf`
+
+Конфигурация сети, в которой будет располагаться инфра
 
 ```terraform
 resource "yandex_vpc_network" "virtual_private_network" {
-  name = "virtual_private_network"
+  name = "virtual-private-network"
 }
 ```
 
-`variables.tf`
+### `variables.tf`
 
 В принципе по описанию понятно, за что отвечает каждая переменная
 ```terraform
 variable "token" {
   description = "OAuth токен вашего аккаунта"
-  type = string
+  type        = string
 }
 variable "cloud_id" {
   description = "Айди облака, в котором будут создаваться ресурсы"
-  type = string
+  type        = string
 }
 variable "folder_id" {
   description = "Айди папки, в которой будут создаваться ресурсы"
-  type = string
+  type        = string
 }
 
-variable "wg_image_id" {
-  description = "Айди образа для ВМ с впном"
-  type = string
-}
-
-variable private_service_image {
+variable "private_service_image" {
   description = "Айди образа для ВМ с вашим сервисом"
-  type = string
+  type        = string
 }
 
-variable "path_to_ssh_key" {
-  description = "Путь к ключу ssh, для доступа к серверу"
-  type = string
+variable "public_ip_address_id" {
+  description = "Айди статического ip-адреса для сервера vpn"
+  type        = string
 }
 ```
+
+## Обзор функциональности
+
+После создания инфраструктуры в облаке с помощью terraform apply, можно полноценно пользоваться развёрнутыми сервисами. В нашем случае, это:
+1. Сервер WireGuard VPN с Web GUI, позволяющим легко добавлять клентов и получать их файлы конфигурации, необходимые для подключения (доступен по адресу, указанному в качестве публичного для севрера VPN и порту 51821)
+![image_6.png](image_6.png)
+2. Приватный сервер с GitLab, доступный по локальному адресу 192.168.20.10 после подключения к VPN
+![image_7.png](image_7.png)
